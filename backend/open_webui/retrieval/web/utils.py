@@ -38,11 +38,20 @@ from open_webui.config import (
     FIRECRAWL_API_BASE_URL,
     FIRECRAWL_API_KEY,
     FIRECRAWL_TIMEOUT,
+    FIRECRAWL_LOADER_MAX_AGE_MS,
+    FIRECRAWL_LOADER_MULTI_URL_MODE,
+    FIRECRAWL_LOADER_ONLY_MAIN_CONTENT,
+    FIRECRAWL_LOADER_PARSE_PDF,
+    FIRECRAWL_LOADER_PROXY_MODE,
     TAVILY_API_KEY,
     TAVILY_EXTRACT_DEPTH,
     EXTERNAL_WEB_LOADER_URL,
     EXTERNAL_WEB_LOADER_API_KEY,
     WEB_FETCH_FILTER_LIST,
+)
+from open_webui.retrieval.web.firecrawl import (
+    aload_firecrawl_documents,
+    load_firecrawl_documents,
 )
 from open_webui.utils.misc import is_string_allowed
 from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL
@@ -178,88 +187,99 @@ class URLProcessingMixin:
         return True
 
 
-class SafeFireCrawlLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
+class SafeFireCrawlLoader(BaseLoader, RateLimitMixin):
     def __init__(
         self,
         web_paths,
         verify_ssl: bool = True,
-        trust_env: bool = False,
         requests_per_second: Optional[float] = None,
         continue_on_failure: bool = True,
         api_key: Optional[str] = None,
         api_url: Optional[str] = None,
-        timeout: Optional[int] = None,
-        mode: Literal['crawl', 'scrape', 'map'] = 'scrape',
-        proxy: Optional[Dict[str, str]] = None,
+        timeout: Optional[Union[int, str]] = None,
         params: Optional[Dict] = None,
+        only_main_content: bool = True,
+        parse_pdf: bool = True,
+        multi_url_mode: str = 'auto',
+        proxy_mode: str = 'basic',
+        max_age_ms: Optional[int] = None,
     ):
-        proxy_server = proxy.get('server') if proxy else None
-        if trust_env and not proxy_server:
-            env_proxies = urllib.request.getproxies()
-            env_proxy_server = env_proxies.get('https') or env_proxies.get('http')
-            if env_proxy_server:
-                if proxy:
-                    proxy['server'] = env_proxy_server
-                else:
-                    proxy = {'server': env_proxy_server}
+        """Document loader for Firecrawl scrape and batch scrape operations."""
         self.web_paths = web_paths
         self.verify_ssl = verify_ssl
         self.requests_per_second = requests_per_second
         self.last_request_time = None
-        self.trust_env = trust_env
         self.continue_on_failure = continue_on_failure
         self.api_key = api_key
-        self.api_url = (api_url or 'https://api.firecrawl.dev').rstrip('/')
+        self.api_url = api_url
         self.timeout = timeout
-        self.mode = mode
         self.params = params or {}
+        self.only_main_content = only_main_content
+        self.parse_pdf = parse_pdf
+        self.multi_url_mode = multi_url_mode
+        self.proxy_mode = proxy_mode
+        self.max_age_ms = max_age_ms
+
+    def _build_load_options(self) -> Dict[str, Any]:
+        return {
+            'verify_ssl': self.verify_ssl,
+            'timeout': self.timeout,
+            'only_main_content': self.only_main_content,
+            'parse_pdf': self.parse_pdf,
+            'multi_url_mode': self.multi_url_mode,
+            'proxy_mode': self.proxy_mode,
+            'max_age_ms': self.max_age_ms,
+            'max_concurrency': (max(1, int(self.requests_per_second)) if self.requests_per_second else None),
+            'params': self.params,
+        }
 
     def lazy_load(self) -> Iterator[Document]:
+        """Load documents using Firecrawl scrape or batch scrape."""
         try:
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {self.api_key}',
-            }
-
-            for url in self.web_paths:
-                payload = {
-                    'url': url,
-                    'formats': ['markdown'],
-                    **self.params,
-                }
-                if self.timeout:
-                    payload['timeout'] = self.timeout * 1000
-
-                response = requests.post(
-                    f'{self.api_url}/v1/scrape',
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout or 60,
-                    verify=self.verify_ssl,
-                )
-                response.raise_for_status()
-                data = response.json().get('data', {})
-                metadata = data.get('metadata', {})
-                source = metadata.get('url') or metadata.get('sourceURL') or url
-
-                yield Document(
-                    page_content=data.get('markdown', ''),
-                    metadata={'source': source},
-                )
-        except Exception as e:
-            if self.continue_on_failure:
-                log.exception(f'Error extracting content from URLs: {e}')
-            else:
-                raise e
-
-    async def alazy_load(self):
-        try:
-            docs = await run_in_threadpool(lambda: list(self.lazy_load()))
+            self._sync_wait_for_rate_limit()
+            operation = 'scrape' if len(self.web_paths) == 1 or self.multi_url_mode == 'single' else 'batch_scrape'
+            log.debug(
+                'Starting Firecrawl %s for %d URLs with params: %s',
+                operation,
+                len(self.web_paths),
+                self.params,
+            )
+            docs = load_firecrawl_documents(
+                self.api_url,
+                self.api_key,
+                self.web_paths,
+                **self._build_load_options(),
+            )
             for doc in docs:
                 yield doc
         except Exception as e:
             if self.continue_on_failure:
-                log.exception(f'Error extracting content from URLs: {e}')
+                log.warning(f'Error extracting content from URLs with Firecrawl: {e}')
+            else:
+                raise e
+
+    async def alazy_load(self):
+        """Async version of lazy_load."""
+        try:
+            await self._wait_for_rate_limit()
+            operation = 'scrape' if len(self.web_paths) == 1 or self.multi_url_mode == 'single' else 'batch_scrape'
+            log.debug(
+                'Starting Firecrawl %s for %d URLs with params: %s',
+                operation,
+                len(self.web_paths),
+                self.params,
+            )
+            docs = await aload_firecrawl_documents(
+                self.api_url,
+                self.api_key,
+                self.web_paths,
+                **self._build_load_options(),
+            )
+            for doc in docs:
+                yield doc
+        except Exception as e:
+            if self.continue_on_failure:
+                log.warning(f'Error extracting content from URLs with Firecrawl: {e}')
             else:
                 raise e
 
@@ -631,6 +651,7 @@ def get_web_loader(
 
     if WEB_LOADER_ENGINE.value == 'firecrawl':
         WebLoaderClass = SafeFireCrawlLoader
+        web_loader_args.pop('trust_env', None)
         web_loader_args['api_key'] = FIRECRAWL_API_KEY.value
         web_loader_args['api_url'] = FIRECRAWL_API_BASE_URL.value
         if FIRECRAWL_TIMEOUT.value:
@@ -638,6 +659,11 @@ def get_web_loader(
                 web_loader_args['timeout'] = int(FIRECRAWL_TIMEOUT.value)
             except ValueError:
                 pass
+        web_loader_args['only_main_content'] = FIRECRAWL_LOADER_ONLY_MAIN_CONTENT.value
+        web_loader_args['parse_pdf'] = FIRECRAWL_LOADER_PARSE_PDF.value
+        web_loader_args['multi_url_mode'] = FIRECRAWL_LOADER_MULTI_URL_MODE.value
+        web_loader_args['proxy_mode'] = FIRECRAWL_LOADER_PROXY_MODE.value
+        web_loader_args['max_age_ms'] = FIRECRAWL_LOADER_MAX_AGE_MS.value
 
     if WEB_LOADER_ENGINE.value == 'tavily':
         WebLoaderClass = SafeTavilyLoader
