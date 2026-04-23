@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:17.9-bookworm
+    container_name: openwebui-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${OPEN_WEBUI_POSTGRES_DB:-openwebui}
+      POSTGRES_USER: ${OPEN_WEBUI_POSTGRES_USER:-openwebui}
+      POSTGRES_PASSWORD: ${OPEN_WEBUI_POSTGRES_PASSWORD:?Set OPEN_WEBUI_POSTGRES_PASSWORD in your environment or .env file}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    networks:
+      - dockernet
+    volumes:
+      - openwebui_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  openwebui:
+    build:
+      context: ${OPEN_WEBUI_BUILD_CONTEXT:-.}
+      dockerfile: Dockerfile
+    image: ${OPEN_WEBUI_IMAGE:-romualdyt/open-webui:codex-firecrawl-v0.9.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_TYPE=postgresql
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=${OPEN_WEBUI_POSTGRES_DB:-openwebui}
+      - DATABASE_USER=${OPEN_WEBUI_POSTGRES_USER:-openwebui}
+      - DATABASE_PASSWORD=${OPEN_WEBUI_POSTGRES_PASSWORD:?Set OPEN_WEBUI_POSTGRES_PASSWORD in your environment or .env file}
+      - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-10}
+      - DATABASE_POOL_MAX_OVERFLOW=${DATABASE_POOL_MAX_OVERFLOW:-20}
+      - DATABASE_POOL_TIMEOUT=${DATABASE_POOL_TIMEOUT:-30}
+      - DATABASE_POOL_RECYCLE=${DATABASE_POOL_RECYCLE:-1800}
+      - DATABASE_ENABLE_SESSION_SHARING=${DATABASE_ENABLE_SESSION_SHARING:-true}
+
+volumes:
+  openwebui_data:
+    name: openwebui_data
+    driver: local
+    driver_opts:
+      type: none
+      device: ${OPENWEBUI_DATA_DIR:-/data/container/openwebui_data}
+      o: bind
+
+  openwebui_postgres:
+    name: openwebui_postgres
+    driver: local
+    driver_opts:
+      type: none
+      device: ${OPEN_WEBUI_POSTGRES_DATA_DIR:-/data/container/openwebui_postgres}
+      o: bind
