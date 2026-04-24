@@ -23,10 +23,12 @@ services:
     build:
       context: ${OPEN_WEBUI_BUILD_CONTEXT:-.}
       dockerfile: Dockerfile
-    image: ${OPEN_WEBUI_IMAGE:-romualdyt/open-webui:codex-firecrawl-v0.9.1}
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:main}
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - dockernet
     environment:
       - DATABASE_TYPE=postgresql
       - DATABASE_HOST=postgres
@@ -39,6 +41,10 @@ services:
       - DATABASE_POOL_TIMEOUT=${DATABASE_POOL_TIMEOUT:-30}
       - DATABASE_POOL_RECYCLE=${DATABASE_POOL_RECYCLE:-1800}
       - DATABASE_ENABLE_SESSION_SHARING=${DATABASE_ENABLE_SESSION_SHARING:-true}
+
+networks:
+  dockernet:
+    external: true
 
 volumes:
   openwebui_data:
