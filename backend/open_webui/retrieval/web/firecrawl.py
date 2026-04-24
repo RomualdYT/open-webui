@@ -52,6 +52,11 @@ def get_firecrawl_scrape_timeout_ms(timeout: Any) -> int | None:
     return min(300000, max(1000, int(seconds * 1000)))
 
 
+def get_firecrawl_client_timeout_seconds(timeout: Any, fallback: float = 60) -> float:
+    # Keep the local HTTP timeout slightly above Firecrawl's scrape timeout.
+    return (get_firecrawl_request_timeout_seconds(timeout) or fallback) + 10
+
+
 def get_firecrawl_wait_timeout_seconds(timeout: Any, url_count: int = 1) -> int:
     seconds = get_firecrawl_request_timeout_seconds(timeout)
     if seconds is not None:
@@ -125,12 +130,20 @@ def _request_firecrawl_json(
     headers: dict[str, str],
     json: dict[str, Any] | None = None,
     timeout: float | None = None,
+    verify: bool = True,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
 
     for attempt in range(FIRECRAWL_MAX_RETRIES + 1):
         try:
-            response = requests.request(method, url, headers=headers, json=json, timeout=timeout)
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=json,
+                timeout=timeout,
+                verify=verify,
+            )
 
             if response.status_code in FIRECRAWL_RETRY_STATUS_CODES and attempt < FIRECRAWL_MAX_RETRIES:
                 delay = _get_retry_delay(response.headers, attempt)
@@ -168,12 +181,23 @@ async def _arequest_firecrawl_json(
     *,
     headers: dict[str, str],
     json: dict[str, Any] | None = None,
+    ssl: bool | None = None,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
 
     for attempt in range(FIRECRAWL_MAX_RETRIES + 1):
         try:
-            async with session.request(method, url, headers=headers, json=json) as response:
+            request_kwargs: dict[str, Any] = {}
+            if ssl is not None:
+                request_kwargs['ssl'] = ssl
+
+            async with session.request(
+                method,
+                url,
+                headers=headers,
+                json=json,
+                **request_kwargs,
+            ) as response:
                 if response.status in FIRECRAWL_RETRY_STATUS_CODES and attempt < FIRECRAWL_MAX_RETRIES:
                     delay = _get_retry_delay(response.headers, attempt)
                     log.warning(
@@ -309,13 +333,20 @@ def _poll_firecrawl_batch_scrape(
     job_id: str,
     wait_timeout: int,
     request_timeout: float | None,
+    verify_ssl: bool,
 ) -> list[dict[str, Any]]:
     started_at = time.monotonic()
     status_url = _build_firecrawl_url(base_url, f'batch/scrape/{job_id}')
     headers = _build_firecrawl_headers(api_key)
 
     while True:
-        data = _request_firecrawl_json('GET', status_url, headers=headers, timeout=request_timeout)
+        data = _request_firecrawl_json(
+            'GET',
+            status_url,
+            headers=headers,
+            timeout=request_timeout,
+            verify=verify_ssl,
+        )
         status = data.get('status')
 
         if status == 'completed':
@@ -337,13 +368,21 @@ async def _apoll_firecrawl_batch_scrape(
     api_key: str | None,
     job_id: str,
     wait_timeout: int,
+    verify_ssl: bool,
 ) -> list[dict[str, Any]]:
     started_at = time.monotonic()
     status_url = _build_firecrawl_url(base_url, f'batch/scrape/{job_id}')
     headers = _build_firecrawl_headers(api_key)
+    ssl = False if not verify_ssl else None
 
     while True:
-        data = await _arequest_firecrawl_json(session, 'GET', status_url, headers=headers)
+        data = await _arequest_firecrawl_json(
+            session,
+            'GET',
+            status_url,
+            headers=headers,
+            ssl=ssl,
+        )
 
         status = data.get('status')
         if status == 'completed':
@@ -365,6 +404,7 @@ def _load_firecrawl_document(
     url: str,
     scrape_payload: dict[str, Any],
     request_timeout: float | None,
+    verify_ssl: bool,
 ) -> Document | None:
     data = _request_firecrawl_json(
         'POST',
@@ -372,6 +412,7 @@ def _load_firecrawl_document(
         headers=_build_firecrawl_headers(api_key),
         json={'url': url, **scrape_payload},
         timeout=request_timeout,
+        verify=verify_ssl,
     )
     return _firecrawl_result_to_document(data.get('data') or {})
 
@@ -383,6 +424,7 @@ async def _aload_firecrawl_document(
     api_key: str | None,
     url: str,
     scrape_payload: dict[str, Any],
+    verify_ssl: bool,
 ) -> Document | None:
     data = await _arequest_firecrawl_json(
         session,
@@ -390,9 +432,33 @@ async def _aload_firecrawl_document(
         _build_firecrawl_url(base_url, 'scrape'),
         headers=_build_firecrawl_headers(api_key),
         json={'url': url, **scrape_payload},
+        ssl=False if not verify_ssl else None,
     )
 
     return _firecrawl_result_to_document(data.get('data') or {})
+
+
+def scrape_firecrawl_url(
+    firecrawl_url: str,
+    firecrawl_api_key: str,
+    url: str,
+    *,
+    verify_ssl: bool = True,
+    timeout: Any = None,
+    params: dict[str, Any] | None = None,
+) -> Document | None:
+    return _load_firecrawl_document(
+        base_url=firecrawl_url,
+        api_key=firecrawl_api_key,
+        url=url,
+        scrape_payload=build_firecrawl_scrape_payload(
+            verify_ssl=verify_ssl,
+            timeout=timeout,
+            extra_payload=params,
+        ),
+        request_timeout=get_firecrawl_client_timeout_seconds(timeout),
+        verify_ssl=verify_ssl,
+    )
 
 
 def load_firecrawl_documents(
@@ -419,7 +485,7 @@ def load_firecrawl_documents(
         max_age_ms=max_age_ms,
         extra_payload=params,
     )
-    request_timeout = (get_firecrawl_request_timeout_seconds(timeout) or 60) + 10
+    request_timeout = get_firecrawl_client_timeout_seconds(timeout)
     multi_url_mode = normalize_firecrawl_multi_url_mode(multi_url_mode)
 
     if len(urls) == 1 or multi_url_mode == 'single':
@@ -430,6 +496,7 @@ def load_firecrawl_documents(
                 url=url,
                 scrape_payload=scrape_payload,
                 request_timeout=request_timeout,
+                verify_ssl=verify_ssl,
             )
             for url in urls
         ]
@@ -449,6 +516,7 @@ def load_firecrawl_documents(
         headers=_build_firecrawl_headers(api_key),
         json=payload,
         timeout=request_timeout,
+        verify=verify_ssl,
     )
 
     if result.get('status') == 'completed':
@@ -464,6 +532,7 @@ def load_firecrawl_documents(
             job_id=job_id,
             wait_timeout=get_firecrawl_wait_timeout_seconds(timeout, len(urls)),
             request_timeout=request_timeout,
+            verify_ssl=verify_ssl,
         )
 
     return [doc for doc in (_firecrawl_result_to_document(result) for result in results) if doc is not None]
@@ -493,7 +562,7 @@ async def aload_firecrawl_documents(
         max_age_ms=max_age_ms,
         extra_payload=params,
     )
-    request_timeout = (get_firecrawl_request_timeout_seconds(timeout) or 60) + 10
+    request_timeout = get_firecrawl_client_timeout_seconds(timeout)
     timeout_config = aiohttp.ClientTimeout(total=request_timeout) if request_timeout else None
     multi_url_mode = normalize_firecrawl_multi_url_mode(multi_url_mode)
 
@@ -510,6 +579,7 @@ async def aload_firecrawl_documents(
                             api_key=api_key,
                             url=url,
                             scrape_payload=scrape_payload,
+                            verify_ssl=verify_ssl,
                         )
 
                 return await _aload_firecrawl_document(
@@ -518,6 +588,7 @@ async def aload_firecrawl_documents(
                     api_key=api_key,
                     url=url,
                     scrape_payload=scrape_payload,
+                    verify_ssl=verify_ssl,
                 )
 
             docs = await asyncio.gather(*(load_url(url) for url in urls))
@@ -537,6 +608,7 @@ async def aload_firecrawl_documents(
             _build_firecrawl_url(base_url, 'batch/scrape'),
             headers=_build_firecrawl_headers(api_key),
             json=payload,
+            ssl=False if not verify_ssl else None,
         )
 
         if result.get('status') == 'completed':
@@ -552,6 +624,7 @@ async def aload_firecrawl_documents(
                 api_key=api_key,
                 job_id=job_id,
                 wait_timeout=get_firecrawl_wait_timeout_seconds(timeout, len(urls)),
+                verify_ssl=verify_ssl,
             )
 
     return [doc for doc in (_firecrawl_result_to_document(result) for result in results) if doc is not None]
@@ -622,7 +695,7 @@ async def search_firecrawl_with_scrape(
         'scrapeOptions': scrape_options,
     }
 
-    request_timeout = (get_firecrawl_request_timeout_seconds(timeout) or count * 3) + 10
+    request_timeout = get_firecrawl_client_timeout_seconds(timeout, fallback=count * 3)
     timeout_config = aiohttp.ClientTimeout(total=request_timeout)
 
     async with aiohttp.ClientSession(timeout=timeout_config) as session:
@@ -632,6 +705,7 @@ async def search_firecrawl_with_scrape(
             _build_firecrawl_url(firecrawl_url, 'search'),
             headers=_build_firecrawl_headers(firecrawl_api_key),
             json=payload,
+            ssl=False if not verify_ssl else None,
         )
 
     results = _filter_results(_get_web_results(data), filter_list)[:count]

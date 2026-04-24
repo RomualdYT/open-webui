@@ -258,7 +258,7 @@ class SafeFireCrawlLoader(BaseLoader, RateLimitMixin):
             else:
                 raise e
 
-    async def alazy_load(self):
+    async def alazy_load(self) -> AsyncIterator[Document]:
         """Async version of lazy_load."""
         try:
             await self._wait_for_rate_limit()
