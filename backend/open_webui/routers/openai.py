@@ -1164,10 +1164,17 @@ async def generate_chat_completion(
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
 
-    # Check if model is a reasoning model that needs special handling
-    if is_openai_new_model(payload['model']):
+    is_official_openai = 'api.openai.com' in url
+    is_azure = api_config.get('azure', False)
+
+    # Check if model is a reasoning model that needs special handling.
+    # Only the official OpenAI and Azure endpoints should get the GPT/o-series
+    # Chat Completions compatibility rewrite. OpenAI-compatible providers such
+    # as Langdock document reasoning_effort on Chat Completions directly and may
+    # reject max_completion_tokens or developer messages.
+    if is_openai_new_model(payload['model']) and (is_official_openai or is_azure):
         payload = openai_reasoning_model_handler(payload)
-    elif 'api.openai.com' not in url:
+    elif not is_official_openai:
         # Remove "max_completion_tokens" from the payload for backward compatibility
         if 'max_completion_tokens' in payload:
             payload['max_tokens'] = payload['max_completion_tokens']
